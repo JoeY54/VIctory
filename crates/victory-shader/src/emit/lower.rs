@@ -21,6 +21,10 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod fp64;
+
+#[cfg(test)]
+pub(crate) use fp64::inline64;
 
 type Why = &'static str;
 
@@ -5729,6 +5733,9 @@ impl<'a> Lower<'a> {
         if let Some(r) = self.valu16(inst, name, guard) {
             return r;
         }
+        if let Some(r) = self.valu64(inst, name, guard) {
+            return r;
+        }
         if let Some(op) = name.strip_prefix("v_pk_") {
             return self.packed16(inst, op, guard);
         }
@@ -7549,6 +7556,8 @@ impl<'a> Lower<'a> {
         let (op, ty) = rest.rsplit_once('_').ok_or("a compare")?;
         let c = self.cur;
         let r = match ty {
+            "f64" if op == "class" => self.class64(inst)?,
+            "f64" => self.compare64(inst, op)?,
             "f32" | "f16" if op == "class" => {
                 // Bit k of src1 tests class k: signalling NaN, quiet NaN,
                 // -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.

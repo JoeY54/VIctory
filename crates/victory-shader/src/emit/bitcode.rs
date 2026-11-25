@@ -15,6 +15,7 @@ enum TypeDef {
     Void,
     Int(u32),
     Float,
+    Double,
     /// Pointee and address space.
     Ptr(Ty, u32),
     Struct(Option<String>, Vec<Ty>),
@@ -47,6 +48,7 @@ struct Global {
 enum Const {
     Int(i64),
     Float(u32),
+    Double(u64),
     Undef,
     Aggregate(Vec<u32>),
 }
@@ -92,6 +94,8 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
+    FpTrunc = 7,
+    FpExt = 8,
     Bitcast = 11,
 }
 
@@ -233,6 +237,9 @@ impl Module {
     pub fn float(&mut self) -> Ty {
         self.ty(TypeDef::Float)
     }
+    pub fn double(&mut self) -> Ty {
+        self.ty(TypeDef::Double)
+    }
     pub fn ptr(&mut self, to: Ty) -> Ty {
         self.ty(TypeDef::Ptr(to, 0))
     }
@@ -281,6 +288,10 @@ impl Module {
     pub fn f32(&mut self, bits: u32) -> V {
         let t = self.float();
         self.constant(t, Const::Float(bits))
+    }
+    pub fn f64(&mut self, bits: u64) -> V {
+        let t = self.double();
+        self.constant(t, Const::Double(bits))
     }
     pub fn undef(&mut self, ty: Ty) -> V {
         self.constant(ty, Const::Undef)
@@ -513,12 +524,33 @@ impl Module {
     pub fn uses(&self) -> Uses {
         let plan = self.plan();
         let wide = |t: Ty| self.types[t.0 as usize] == TypeDef::Int(64);
+        let double = |t: Ty| self.types[t.0 as usize] == TypeDef::Double;
         let mut u = Uses::default();
         for b in plan.layout.iter().map(|&b| &self.blocks[b]) {
             for &i in b.phis.iter().chain(&b.body).filter(|&&i| plan.live[i as usize]) {
                 let inst = &self.insts[i as usize];
                 u.int64 |= wide(inst.ty);
-                for_each_operand(&inst.op, |v| u.int64 |= wide(self.type_of(v)));
+                let mut doubles = double(inst.ty);
+                for_each_operand(&inst.op, |v| {
+                    u.int64 |= wide(self.type_of(v));
+                    doubles |= double(self.type_of(v));
+                });
+                u.double |= doubles;
+                // The double operations of D3D 11.1's extensions, as DXC
+                // counts them: division, conversions to and from integers
+                // and the fused multiply-add.
+                u.double_ext |= doubles
+                    && match &inst.op {
+                        Op::Bin(op, ..) => *op == Bin::SDiv,
+                        Op::Cast(op, _) => {
+                            matches!(op, Cast::FpToUi | Cast::FpToSi | Cast::UiToFp | Cast::SiToFp)
+                        }
+                        Op::Call(f, args) => {
+                            self.funcs[*f as usize].name == "dx.op.tertiary.f64"
+                                && args.first().and_then(|&a| self.int_value(a)) == Some(47)
+                        }
+                        _ => false,
+                    };
                 let Op::Call(f, args) = &inst.op else { continue };
                 let name = self.funcs[*f as usize].name.as_str();
                 if name.starts_with("dx.op.createHandleFromHeap") {
@@ -747,6 +779,7 @@ impl Module {
             match t {
                 TypeDef::Void => w.record(2, &[]),
                 TypeDef::Float => w.record(3, &[]),
+                TypeDef::Double => w.record(4, &[]),
                 TypeDef::Int(b) => w.record(7, &[u64::from(*b)]),
                 TypeDef::Ptr(p, space) => w.record(8, &[u64::from(p.0), u64::from(*space)]),
                 TypeDef::Array(n, e) => w.record(11, &[u64::from(*n), u64::from(e.0)]),
@@ -838,6 +871,7 @@ impl Module {
                 Const::Undef => w.record(3, &[]),
                 Const::Int(v) => w.record(4, &[signed(*v)]),
                 Const::Float(bits) => w.record(6, &[u64::from(*bits)]),
+                Const::Double(bits) => w.record(6, &[*bits]),
                 Const::Aggregate(ids) => {
                     let r: Vec<u64> = ids.iter().map(|&i| const_id(i)).collect();
                     w.record(7, &r);
@@ -1022,6 +1056,11 @@ pub struct Uses {
     pub wave: bool,
     /// 64-bit integers.
     pub int64: bool,
+    /// Doubles.
+    pub double: bool,
+    /// The doubles of D3D 11.1's extensions (division, conversions to and
+    /// from integers, fused multiply-add).
+    pub double_ext: bool,
 }
 
 /// What [`Module::write`] writes ([`Module::plan`]).

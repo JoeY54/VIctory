@@ -400,6 +400,9 @@ enum Kind {
     /// An f32 as `F32`, finite values within `abs` of each other (functions
     /// whose host error is bounded absolutely, as sine and log near 1).
     Abs { abs: f32 },
+    /// An f64 in each pair of dwords (low first), as `F32` in 64 bits
+    /// (compared by [`matches`], not dword by dword).
+    F64 { ulps: u64, any_zero: bool },
 }
 
 const INT: Kind = Kind::Int;
@@ -450,6 +453,37 @@ fn same(kind: Kind, want: u32, got: u32) -> bool {
             close(0x8000, 0x7C00, want & 0xFFFF, got & 0xFFFF, ulps, false)
                 && close(0x8000, 0x7C00, want >> 16, got >> 16, ulps, false)
         }
+        // A single dword of a pair: bit for bit.
+        Kind::F64 { .. } => want == got,
+    }
+}
+
+/// Two f64 (bits) as [`Kind::F64`] compares them.
+fn close64(a: u64, b: u64, ulps: u64, any_zero: bool) -> bool {
+    const SIGN: u64 = 1 << 63;
+    const INF: u64 = 0x7FF0_0000_0000_0000;
+    let mag = |x: u64| x & !SIGN;
+    let nan = |x: u64| mag(x) > INF;
+    if nan(a) || nan(b) {
+        return nan(a) && nan(b);
+    }
+    if mag(a) == 0 || mag(b) == 0 {
+        return a == b || any_zero && mag(a) == 0 && mag(b) == 0;
+    }
+    if mag(a) == INF || mag(b) == INF {
+        return a == b;
+    }
+    a & SIGN == b & SIGN && mag(a).abs_diff(mag(b)) <= ulps
+}
+
+/// Whether `got` (a result's dwords, as many as `want` has) is `want`.
+fn matches(kind: Kind, want: &[u32], got: &[u32]) -> bool {
+    match kind {
+        Kind::F64 { ulps, any_zero } => want.chunks(2).zip(got.chunks(2)).all(|(w, g)| {
+            let join = |x: &[u32]| u64::from(x[0]) | u64::from(x[1]) << 32;
+            w.len() == 2 && g.len() == 2 && close64(join(w), join(g), ulps, any_zero)
+        }),
+        _ => want.iter().zip(got).all(|(&w, &g)| same(kind, w, g)),
     }
 }
 
@@ -502,9 +536,7 @@ impl Probe {
         ours: impl Fn([u32; 4]) -> Vec<u32> + 'static,
     ) -> Self {
         let kind = self.kind;
-        self.shows(defect, move |i| {
-            !hw(i).iter().zip(ours(i)).all(|(&a, b)| same(kind, a, b))
-        })
+        self.shows(defect, move |i| !matches(kind, &hw(i), &ours(i)))
     }
 }
 
@@ -603,7 +635,7 @@ fn check(probes: &[Probe]) -> Vec<String> {
             if let Some(model) = &p.model {
                 let want = model(input);
                 for (k, (label, r)) in results.iter().enumerate() {
-                    if !want.iter().zip(&r[i]).all(|(&w, &g)| same(p.kind, w, g)) {
+                    if !matches(p.kind, &want, &r[i]) {
                         wrong[k] += 1;
                         if wrong[k] <= 6 {
                             bad.push(example(label, i, &want, &r[i]));
@@ -612,8 +644,7 @@ fn check(probes: &[Probe]) -> Vec<String> {
                     }
                 }
             }
-            let agree =
-                |x: &[u32; 4], y: &[u32; 4]| x.iter().zip(y).all(|(&a, &b)| same(p.kind, a, b));
+            let agree = |x: &[u32; 4], y: &[u32; 4]| matches(p.kind, x, y);
             if results.len() == 2 && !agree(&results[0].1[i], &results[1].1[i]) {
                 apart += 1;
                 if apart <= 4 {
@@ -3009,4 +3040,458 @@ fn lds_bytes_and_halves_match_the_hardware() {
             vec![i[3] & 0xFF | byte(i[0], 0) << 8 | (i[1] & 0xFFFF) << 16]
         }),
     ]));
+}
+
+// ---- 64-bit floats ----
+
+/// Doubles at the edges: signed zeros, the smallest and largest
+/// denormals (kept by the console's mode), the smallest normals, halves
+/// and ties for the roundings, the whole-number threshold 2^52, the
+/// largest finite values, infinities, NaNs (quiet and signalling), and the
+/// limits of the 32-bit conversions.
+const F64_EDGES: &[u64] = &[
+    0,
+    0x8000_0000_0000_0000,
+    1,
+    0x8000_0000_0000_0001,
+    0x000F_FFFF_FFFF_FFFF,
+    0x800F_FFFF_FFFF_FFFF,
+    0x0010_0000_0000_0000,
+    0x8010_0000_0000_0000,
+    0x3FF0_0000_0000_0000, // 1
+    0xBFF0_0000_0000_0000, // -1
+    0x3FE0_0000_0000_0000, // 0.5
+    0xBFE0_0000_0000_0000, // -0.5
+    0x3FDF_FFFF_FFFF_FFFF, // 0.49999999999999994
+    0x3FE0_0000_0000_0001, // 0.5000000000000001
+    0xBFE8_0000_0000_0000, // -0.75
+    0x3FF8_0000_0000_0000, // 1.5
+    0x4004_0000_0000_0000, // 2.5
+    0xC004_0000_0000_0000, // -2.5
+    0x432F_FFFF_FFFF_FFFF, // 2^52 - 0.5
+    0x4330_0000_0000_0000, // 2^52
+    0xC330_0000_0000_0001, // -(2^52 + 1)
+    0x3FD5_5555_5555_5555, // 1/3
+    0x4009_21FB_5444_2D18, // pi
+    0x41DF_FFFF_FFE0_0000, // 2147483647.5
+    0x41E0_0000_0000_0000, // 2^31
+    0xC1E0_0000_0010_0000, // -2147483648.5
+    0xC1E0_0000_0020_0000, // -2147483649
+    0x41EF_FFFF_FFF0_0000, // 4294967295.5
+    0x41F0_0000_0000_0000, // 2^32
+    0x7E37_E43C_8800_759C, // 1e300
+    0x01A5_6E1F_C2F8_F359, // 1e-300
+    0x7FEF_FFFF_FFFF_FFFF,
+    0xFFEF_FFFF_FFFF_FFFF,
+    0x7FF0_0000_0000_0000,
+    0xFFF0_0000_0000_0000,
+    0x7FF8_0000_0000_0000,
+    0xFFF8_0000_0000_0000,
+    0x7FF0_0000_0000_0001,
+];
+
+const F64: Kind = Kind::F64 {
+    ulps: 0,
+    any_zero: false,
+};
+
+fn dl(x: u64) -> f64 {
+    f64::from_bits(x)
+}
+
+fn nan64(x: u64) -> bool {
+    x & !(1 << 63) > 0x7FF0_0000_0000_0000
+}
+
+/// A double's dwords, low first.
+fn dw(x: u64) -> Vec<u32> {
+    vec![x as u32, (x >> 32) as u32]
+}
+
+/// The double in input dwords `k` and `k + 1`.
+fn at64(i: [u32; 4], k: usize) -> u64 {
+    u64::from(i[k]) | u64::from(i[k + 1]) << 32
+}
+
+fn unary64(xs: &[u64]) -> Vec<[u32; 4]> {
+    xs.iter().map(|&a| [a as u32, (a >> 32) as u32, 0, OLD]).collect()
+}
+
+fn pairs64(xs: &[u64], ys: &[u64]) -> Vec<[u32; 4]> {
+    xs.iter()
+        .flat_map(|&a| ys.iter().map(move |&b| [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32]))
+        .collect()
+}
+
+/// A double with a dword (the exponent of `ldexp`, the mask of a class test).
+fn with_dword(xs: &[u64], ys: &[u32]) -> Vec<[u32; 4]> {
+    xs.iter()
+        .flat_map(|&a| ys.iter().map(move |&b| [a as u32, (a >> 32) as u32, b, OLD]))
+        .collect()
+}
+
+fn mods_in64(x: u64, k: usize, m: M) -> u64 {
+    let mut x = x;
+    if m.abs >> k & 1 != 0 {
+        x &= !(1 << 63);
+    }
+    if m.neg >> k & 1 != 0 {
+        x ^= 1 << 63;
+    }
+    x
+}
+
+/// The clamp of a double result to [0, 1]: +0 for NaN (DX10 clamp) and
+/// for anything at or below 0.
+fn clamp64(r: u64, m: M) -> u64 {
+    if !m.clamp {
+        return r;
+    }
+    if nan64(r) || dl(r) <= 0.0 {
+        0
+    } else if dl(r) >= 1.0 {
+        1.0f64.to_bits()
+    } else {
+        r
+    }
+}
+
+/// The hardware's v_min_f64 / v_max_f64 with IEEE mode off: a NaN operand
+/// gives the other (RDNA2 ISA), -0 orders below +0 (as `v_max_f32`).
+fn min_max64(max: bool, a: u64, b: u64) -> u64 {
+    if nan64(a) {
+        return b;
+    }
+    if nan64(b) {
+        return a;
+    }
+    let key = |x: u64| if x >> 63 != 0 { !x } else { x | 1 << 63 };
+    let a_lt_b = key(a) < key(b);
+    if a_lt_b == max { b } else { a }
+}
+
+/// `x * 2^n`, rounded once to nearest even: worked on the integer
+/// significand, independently of the lowering's scaling steps.
+fn ldexp64(x: u64, n: i32) -> u64 {
+    let sign = x & 1 << 63;
+    let mag = x & !(1 << 63);
+    if mag == 0 || mag >= 0x7FF0_0000_0000_0000 {
+        return x;
+    }
+    let (mut e, mut m) = ((mag >> 52) as i64, mag & 0x000F_FFFF_FFFF_FFFF);
+    if e == 0 {
+        // Normalize a denormal: value = m * 2^-1074.
+        let shift = m.leading_zeros() as i64 - 11;
+        m <<= shift;
+        e = 1 - shift;
+    }
+    m |= 1 << 52;
+    // value = m * 2^(e - 1075).
+    let e = e + i64::from(n);
+    if e >= 0x7FF {
+        return sign | 0x7FF0_0000_0000_0000;
+    }
+    if e >= 1 {
+        return sign | (e as u64) << 52 | (m & 0x000F_FFFF_FFFF_FFFF);
+    }
+    // A denormal result: m * 2^(e - 1075) = (m >> (1 - e)) * 2^-1074.
+    let shift = (1 - e) as u32;
+    if shift > 54 {
+        return sign;
+    }
+    let kept = m >> shift;
+    let lost = m & ((1 << shift) - 1);
+    let half = 1 << (shift - 1);
+    let up = lost > half || lost == half && kept & 1 != 0;
+    sign | (kept + u64::from(up))
+}
+
+/// The fraction and exponent of `frexp` (fraction in [0.5, 1)); a zero,
+/// an infinity or a NaN as it is with exponent 0 (RDNA2 ISA,
+/// `V_FREXP_MANT_F64`, `V_FREXP_EXP_I32_F64`; denormals normalized, as the
+/// console keeps them).
+fn frexp64(x: u64) -> (u64, i32) {
+    let mag = x & !(1 << 63);
+    if mag == 0 || mag >= 0x7FF0_0000_0000_0000 {
+        return (x, 0);
+    }
+    let (mut e, mut m) = ((mag >> 52) as i32, mag & 0x000F_FFFF_FFFF_FFFF);
+    if e == 0 {
+        let shift = m.leading_zeros() as i32 - 11;
+        m = (m << shift) & 0x000F_FFFF_FFFF_FFFF;
+        e = 1 - shift;
+    }
+    (x & 1 << 63 | 0x3FE0_0000_0000_0000 | m, e - 1022)
+}
+
+/// `x - floor(x)` below 1.0; NaN for an infinity.
+fn fract64(x: u64) -> u64 {
+    if nan64(x) {
+        return x;
+    }
+    if x & !(1 << 63) == 0x7FF0_0000_0000_0000 {
+        return 0xFFF8_0000_0000_0000;
+    }
+    let f = dl(x);
+    let r = f - f.floor();
+    if r >= 1.0 { 0x3FEF_FFFF_FFFF_FFFF } else { r.to_bits() }
+}
+
+/// The class bit `v_cmp_class_f64` tests for `x` (as [`class`]).
+fn class64(x: u64) -> u32 {
+    let (neg, mag) = (x >> 63 != 0, x & !(1 << 63));
+    let bit = match mag {
+        0x7FF0_0000_0000_0001..=0x7FF7_FFFF_FFFF_FFFF => 0,
+        0x7FF8_0000_0000_0000.. => 1,
+        0x7FF0_0000_0000_0000 => 9,
+        0x0010_0000_0000_0000.. => 8,
+        1.. => 7,
+        0 => 6,
+    };
+    match (neg, bit) {
+        (_, 0 | 1) => bit,
+        (true, b) => 11 - b,
+        (false, b) => b,
+    }
+}
+
+/// A VOPC f64 compare (`v_cmp_*_f64`, opcode 0x20 + `p`) of two doubles.
+fn compare64(p: u16, a: u64, b: u64) -> bool {
+    let (x, y) = (dl(a), dl(b));
+    let ord = !x.is_nan() && !y.is_nan();
+    match p {
+        0 => false,
+        1 => x < y,
+        2 => x == y,
+        3 => x <= y,
+        4 => x > y,
+        5 => ord && x != y,
+        6 => x >= y,
+        7 => ord,
+        8 => !ord,
+        9 => !ord || x < y,
+        10 => !ord || x == y,
+        11 => !ord || x <= y,
+        12 => !ord || x > y,
+        13 => !ord || x != y,
+        14 => !ord || x >= y,
+        _ => true,
+    }
+}
+
+/// A 32-bit conversion toward zero, saturating, NaN 0 (as the f32 ones).
+fn to_int64(x: u64, signed: bool) -> u32 {
+    let f = dl(x);
+    if f.is_nan() {
+        return 0;
+    }
+    if signed {
+        f.trunc().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32 as u32
+    } else {
+        f.trunc().clamp(0.0, f64::from(u32::MAX)) as u32
+    }
+}
+
+/// Two-source VOP3 f64 arithmetic: sources v[1:2] and v[3:4] with the
+/// modifiers, the result in v[5:6].
+fn vop3_d2(op: u16, m: M, f: fn(f64, f64) -> f64, inputs: Vec<[u32; 4]>) -> Probe {
+    let kind = Kind::F64 {
+        ulps: 0,
+        any_zero: m.clamp,
+    };
+    probe(vop3(op, 5, [v(1), v(3), 0], m), inputs, kind, move |i| {
+        let (a, b) = (mods_in64(at64(i, 0), 0, m), mods_in64(at64(i, 2), 1, m));
+        dw(clamp64(f(dl(a), dl(b)).to_bits(), m))
+    })
+}
+
+/// Arithmetic: adds and products with the source modifiers and the clamp,
+/// fused multiply-adds (a * b + a, and against inline constants), minimum
+/// and maximum, `ldexp`, and the inline constants and a literal as
+/// 64-bit operands.
+fn fp64_arithmetic_probes() -> Vec<Probe> {
+    let ab = pairs64(F64_EDGES, F64_EDGES);
+    let mut p = Vec::new();
+    for m in source_mods().into_iter().filter(|m| m.abs >> 2 == 0 && m.neg >> 2 == 0) {
+        p.push(vop3_d2(0x164, m, |a, b| a + b, ab.clone()));
+    }
+    let clamp = M { clamp: true, ..NONE };
+    p.push(vop3_d2(0x164, clamp, |a, b| a + b, ab.clone()));
+    p.push(vop3_d2(0x165, NONE, |a, b| a * b, ab.clone()));
+    p.push(vop3_d2(0x165, M { neg: 1, ..NONE }, |a, b| a * b, ab.clone()));
+    p.push(probe(vop3(0x14C, 5, [v(1), v(3), v(1)], NONE), ab.clone(), F64, |i| {
+        let (a, b) = (dl(at64(i, 0)), dl(at64(i, 2)));
+        dw(a.mul_add(b, a).to_bits())
+    }));
+    for (code, c) in [(243u16, -1.0f64), (240, 0.5)] {
+        p.push(probe(vop3(0x14C, 5, [v(1), v(3), code], NONE), ab.clone(), F64, move |i| {
+            let (a, b) = (dl(at64(i, 0)), dl(at64(i, 2)));
+            dw(a.mul_add(b, c).to_bits())
+        }));
+    }
+    for (op, max) in [(0x166u16, false), (0x167, true)] {
+        p.push(probe(vop3(op, 5, [v(1), v(3), 0], NONE), ab.clone(), F64, move |i| {
+            dw(min_max64(max, at64(i, 0), at64(i, 2)))
+        }));
+    }
+    let exponents: Vec<u32> = [0i32, 1, -1, 52, -52, 1023, -1022, -1074, 1074, 2046, -2098, 4000, -4000]
+        .into_iter()
+        .chain([i32::MAX, i32::MIN])
+        .map(|n| n as u32)
+        .collect();
+    p.push(probe(
+        vop3(0x168, 5, [v(1), v(3), 0], NONE),
+        with_dword(F64_EDGES, &exponents),
+        F64,
+        |i| dw(ldexp64(at64(i, 0), i[2] as i32)),
+    ));
+    // Inline constants: integers sign-extended to 64 bits, floats as
+    // doubles (1/(2π) as the hardware holds it); a literal is the high dword.
+    let xs = unary64(F64_EDGES);
+    for code in [int(1), 193, 240, 241, 242, 243, 244, 245, 246, 247, 248] {
+        let k = lower::inline64(code as u8).expect("an inline constant");
+        p.push(probe(vop3(0x164, 5, [v(1), code, 0], NONE), xs.clone(), F64, move |i| {
+            dw((dl(at64(i, 0)) + dl(k)).to_bits())
+        }));
+    }
+    let mut literal = vop3(0x164, 5, [v(1), 255, 0], NONE).to_vec();
+    literal.push(0x4000_0000);
+    p.push(probe(literal, xs, F64, |i| {
+        dw((dl(at64(i, 0)) + 2.0).to_bits())
+    }));
+    p
+}
+
+#[test]
+fn fp64_arithmetic_matches_the_hardware() {
+    assert_clean(check(&fp64_arithmetic_probes()));
+}
+
+/// Roundings to whole numbers, the fraction, `frexp`, the reciprocal and
+/// the square roots (within a few ULPs of the exact results, where the
+/// hardware's own are within 2^29: a program's refinement steps take
+/// either to the same result).
+fn fp64_unary_probes() -> Vec<Probe> {
+    let xs = unary64(F64_EDGES);
+    let round = |op: u16, f: fn(f64) -> f64| {
+        probe([vop1(op, 5, v(1))], xs.clone(), F64, move |i| dw(f(dl(at64(i, 0))).to_bits()))
+    };
+    let within = |ulps| Kind::F64 {
+        ulps,
+        any_zero: false,
+    };
+    vec![
+        round(0x17, f64::trunc),
+        round(0x18, f64::ceil),
+        round(0x19, f64::round_ties_even),
+        round(0x1A, f64::floor),
+        probe([vop1(0x3E, 5, v(1))], xs.clone(), F64, |i| dw(fract64(at64(i, 0)))),
+        probe([vop1(0x3D, 5, v(1))], xs.clone(), F64, |i| dw(frexp64(at64(i, 0)).0)),
+        probe([vop1(0x3C, 5, v(1))], xs.clone(), INT, |i| {
+            vec![frexp64(at64(i, 0)).1 as u32]
+        }),
+        probe([vop1(0x2F, 5, v(1))], xs.clone(), within(1), |i| {
+            dw((1.0 / dl(at64(i, 0))).to_bits())
+        }),
+        probe([vop1(0x34, 5, v(1))], xs.clone(), within(2), |i| {
+            dw(dl(at64(i, 0)).sqrt().to_bits())
+        }),
+        probe([vop1(0x31, 5, v(1))], xs, within(4), |i| {
+            dw((1.0 / dl(at64(i, 0)).sqrt()).to_bits())
+        }),
+    ]
+}
+
+#[test]
+fn fp64_roundings_and_roots_match_the_hardware() {
+    assert_clean(check(&fp64_unary_probes()));
+}
+
+/// Conversions between doubles and f32 (whose denormals read and write as
+/// zeros) and 32-bit integers (saturating, NaN 0).
+fn fp64_conversion_probes() -> Vec<Probe> {
+    let xs = unary64(F64_EDGES);
+    let fs = unary(F32_EDGES);
+    let ints = unary(U32_EDGES);
+    vec![
+        probe([vop1(0x10, 5, v(1))], fs, F64, |i| dw(d(i[0]).to_bits())),
+        probe([vop1(0x0F, 5, v(1))], xs.clone(), F32, |i| vec![out64(dl(at64(i, 0)))]),
+        probe([vop1(0x03, 5, v(1))], xs.clone(), INT, |i| vec![to_int64(at64(i, 0), true)]),
+        probe([vop1(0x15, 5, v(1))], xs, INT, |i| vec![to_int64(at64(i, 0), false)]),
+        probe([vop1(0x04, 5, v(1))], ints.clone(), F64, |i| {
+            dw(f64::from(i[0] as i32).to_bits())
+        }),
+        probe([vop1(0x16, 5, v(1))], ints, F64, |i| dw(f64::from(i[0]).to_bits())),
+    ]
+}
+
+#[test]
+fn fp64_conversions_match_the_hardware() {
+    assert_clean(check(&fp64_conversion_probes()));
+}
+
+/// Every VOPC f64 compare (to VCC) and the class test, over the edges:
+/// unordered with a NaN, the zeros equal, denormals values.
+fn fp64_compare_probes() -> Vec<Probe> {
+    let ab = pairs64(F64_EDGES, F64_EDGES);
+    let mut p: Vec<Probe> = (0..16u16)
+        .map(|k| {
+            probe(with_vcc(vopc(0x20 + k, v(1), 3)), ab.clone(), INT, move |i| {
+                vec![u32::from(compare64(k, at64(i, 0), at64(i, 2)))]
+            })
+        })
+        .collect();
+    let masks: Vec<u32> = (0..10).map(|k| 1 << k).chain([0x3FF, 0x3, 0x204]).collect();
+    p.push(probe(
+        with_vcc(vopc(0xA8, v(1), 3)),
+        with_dword(F64_EDGES, &masks),
+        INT,
+        |i| vec![i[2] >> class64(at64(i, 0)) & 1],
+    ));
+    p
+}
+
+#[test]
+fn fp64_compares_match_the_hardware() {
+    assert_clean(check(&fp64_compare_probes()));
+}
+
+/// Without a device: every 64-bit probe lowers, and the validator (where
+/// there is one) takes it, with the feature bits its operations call for:
+/// doubles where it computes with them, the 11.1 double extensions for a
+/// fused multiply-add, a division or an integer conversion, neither where
+/// the work is all on the bits (minimum and maximum).
+#[test]
+fn fp64_programs_lower_validate_and_declare_doubles() {
+    use crate::dxbc::{Container, FourCC};
+    let mut validator =
+        validator::Validator::load(validator::Validator::default_path().as_deref()).ok();
+    let probes = [
+        fp64_arithmetic_probes(),
+        fp64_unary_probes(),
+        fp64_conversion_probes(),
+        fp64_compare_probes(),
+    ];
+    for p in probes.iter().flatten() {
+        let what = disassembly(&p.body, p.scalar);
+        let shader = lower_program(&program(&p.body, p.scalar))
+            .unwrap_or_else(|e| panic!("{what}: not lowered: {e}"));
+        if let Some(v) = validator.as_mut() {
+            v.validate(&mut shader.dxil.clone())
+                .unwrap_or_else(|e| panic!("{what}: invalid DXIL: {e}"));
+        }
+    }
+    let features = |body: &[u32]| {
+        let shader = lower_program(&program(body, false)).expect("lowered");
+        let c = Container::parse(&shader.dxil).expect("a container");
+        let sfi0 = c.part(FourCC::SFI0).expect("SFI0").data;
+        u64::from_le_bytes(sfi0.try_into().expect("8 bytes"))
+    };
+    let (doubles, ext) = (0x1, 0x20);
+    let add = features(&vop3(0x164, 5, [v(1), v(3), 0], NONE));
+    assert_eq!(add & (doubles | ext), doubles, "v_add_f64: SFI0 {add:#x}");
+    let fma = features(&vop3(0x14C, 5, [v(1), v(3), v(1)], NONE));
+    assert_eq!(fma & (doubles | ext), doubles | ext, "v_fma_f64: SFI0 {fma:#x}");
+    let max = features(&vop3(0x167, 5, [v(1), v(3), 0], NONE));
+    assert_eq!(max & (doubles | ext), 0, "v_max_f64: SFI0 {max:#x}");
 }
