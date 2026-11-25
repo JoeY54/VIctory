@@ -80,7 +80,13 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
             };
             let desc = adapter.GetDesc1()?;
             let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
-            if !software && desc.DedicatedVideoMemory > 0 {
+            // Local verification patch (not for upstream): VICTORY_ADAPTER picks
+            // the hardware adapter whose description contains the given text.
+            let name = String::from_utf16_lossy(&desc.Description);
+            let wanted = std::env::var("VICTORY_ADAPTER")
+                .map_or(true, |w| name.to_lowercase().contains(&w.to_lowercase()));
+            if !software && desc.DedicatedVideoMemory > 0 && wanted {
+                eprintln!("hardware adapter: {}", name.trim_end_matches('\0'));
                 return Ok(adapter);
             }
         }

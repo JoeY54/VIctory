@@ -2216,3 +2216,50 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+/// FIND-21 verification (local, not for upstream): doubles read from an odd
+/// dword offset of the input load, or from sources sharing a dword. Cases from
+/// bvtterbroot's reports on #1262 (RDNA2/RDNA3 wrong, WARP right). Prints every
+/// result per backend, then fails if any case is wrong.
+#[test]
+fn find21_odd_offset_and_shared_dword_sources() {
+    let inputs = [
+        [0, 0x3ff8_0000, 0x4000_0000, 0],
+        [0x1111_1111, 0x3ff8_0000, 0x4000_0000, 0x4010_0000],
+    ];
+    let pair = |w: [u32; 4], lo: usize| {
+        f64::from_bits(u64::from(w[lo]) | u64::from(w[lo + 1]) << 32)
+    };
+    // (label, op, src0 first vgpr, src1: Some(first vgpr) or None for 1.0)
+    type Case = (&'static str, u16, u8, Option<u8>);
+    let cases: [Case; 8] = [
+        ("v_add_f64 v[6:7], v[1:2], 1.0", 0x164, 1, None),
+        ("v_add_f64 v[6:7], v[3:4], 1.0", 0x164, 3, None),
+        ("v_add_f64 v[6:7], v[1:2], v[3:4]", 0x164, 1, Some(3)),
+        ("v_add_f64 v[6:7], v[2:3], 1.0", 0x164, 2, None),
+        ("v_add_f64 v[6:7], v[2:3], v[2:3]", 0x164, 2, Some(2)),
+        ("v_add_f64 v[6:7], v[2:3], v[3:4]", 0x164, 2, Some(3)),
+        ("v_add_f64 v[6:7], v[1:2], v[2:3]", 0x164, 1, Some(2)),
+        ("v_mul_f64 v[6:7], v[1:2], v[2:3]", 0x165, 1, Some(2)),
+    ];
+    let mut bad = Vec::new();
+    for (label, op, s0, s1) in cases {
+        let src1 = s1.map_or(242, vgpr);
+        run_f64_raw(&vop3(op, 6, vgpr(s0), src1, 0), &inputs, |backend, i, got| {
+            let w = inputs[i];
+            let a = pair(w, usize::from(s0) - 1);
+            let b = s1.map_or(1.0, |r| pair(w, usize::from(r) - 1));
+            let want = if op == 0x164 { a + b } else { a * b };
+            let ok = same_f64(got, want);
+            eprintln!(
+                "FIND21 {backend:8} input{i} {label:34} got {got:#018x} want {:#018x} {}",
+                want.to_bits(),
+                if ok { "ok" } else { "WRONG" }
+            );
+            if !ok {
+                bad.push(format!("{backend}: input{i} {label}"));
+            }
+        });
+    }
+    assert!(bad.is_empty(), "FIND-21 cases wrong:\n{}", bad.join("\n"));
+}
