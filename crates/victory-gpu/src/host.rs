@@ -189,6 +189,23 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Ok(wanted) = std::env::var("VICTORY_ADAPTER") {
+            // Local verification patch (not for upstream): the hardware
+            // adapter whose description contains VICTORY_ADAPTER.
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let mut chosen = None;
+            for index in 0.. {
+                let Ok(adapter) = factory.EnumAdapters1(index) else { break };
+                let desc = adapter.GetDesc1()?;
+                let name = String::from_utf16_lossy(&desc.Description);
+                if name.to_lowercase().contains(&wanted.to_lowercase()) {
+                    eprintln!("host adapter: {}", name.trim_end_matches(char::from(0)));
+                    chosen = Some(adapter);
+                    break;
+                }
+            }
+            let adapter = chosen.ok_or_else(windows::core::Error::empty)?;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             // Whether a GPU hang ends the run or freezes the PC (#1054).
